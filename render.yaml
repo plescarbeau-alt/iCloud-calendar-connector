@@ -14,3 +14,7 @@ services:
         sync: false
       - key: ICLOUD_MCP_BEARER_TOKEN
         generateValue: true
+      - key: ICLOUD_OAUTH_SIGNING_KEY
+        generateValue: true
+      - key: PUBLIC_URL
+        value: https://codex-icloud-calendar.onrender.com
