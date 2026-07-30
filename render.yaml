@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: codex-icloud-calendar
+    runtime: docker
+    plan: free
+    envVars:
+      - key: ICLOUD_CALDAV_URL
+        value: https://caldav.icloud.com/
+      - key: ICLOUD_USERNAME
+        sync: false
+      - key: ICLOUD_APP_PASSWORD
+        sync: false
+      - key: ICLOUD_ALLOWED_CALENDARS
+        sync: false
+      - key: ICLOUD_MCP_BEARER_TOKEN
+        generateValue: true
