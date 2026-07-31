@@ -173,6 +173,7 @@ def _event_result(resource: Any, calendar_name: str) -> dict[str, Any]:
 
 mcp = FastMCP(
     "iCloud Calendar",
+    host="0.0.0.0",
     instructions=(
         "Access only calendars named in ICLOUD_ALLOWED_CALENDARS. "
         "Use timezone-aware ISO 8601 date-times and verify writes by reading them back."
