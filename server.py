@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import html
 import hmac
@@ -579,6 +580,13 @@ async def terms(_: Request) -> HTMLResponse:
     )
 
 
+@contextlib.asynccontextmanager
+async def lifespan(_: Starlette):
+    """Start the Streamable HTTP session manager for the mounted MCP app."""
+    async with mcp.session_manager.run():
+        yield
+
+
 app = Starlette(
     routes=[
         Route("/", health),
@@ -593,7 +601,8 @@ app = Starlette(
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
         Mount("/", app=mcp.streamable_http_app()),
-    ]
+    ],
+    lifespan=lifespan,
 )
 
 
