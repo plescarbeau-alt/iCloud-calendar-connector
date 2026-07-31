@@ -372,16 +372,25 @@ def _component_matches_exactly(
 def _calendar_resources_in_window(
     calendar: Any, start: datetime, end: datetime, *, expand: bool
 ) -> list[Any]:
-    """Fetch a padded window so legacy floating events are not lost by iCloud."""
-    try:
-        candidates = calendar.search(
-            event=True,
-            start=start - timedelta(days=1),
-            end=end + timedelta(days=1),
-            expand=expand,
-        )
-    except Exception:
-        candidates = calendar.events()
+    """Fetch a bounded padded window without ever listing the whole calendar."""
+    last_error: Exception | None = None
+    candidates: list[Any] | None = None
+    for padding_days in (1, 3, 7):
+        try:
+            candidates = calendar.search(
+                event=True,
+                start=start - timedelta(days=padding_days),
+                end=end + timedelta(days=padding_days),
+                expand=expand,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+    if candidates is None:
+        raise RuntimeError(
+            "iCloud rejected all bounded calendar searches; refusing to scan the "
+            "entire calendar."
+        ) from last_error
     resources = []
     for resource in candidates:
         try:
@@ -412,15 +421,24 @@ def _resource_delete_status(resource: Any) -> int:
     return response.status
 
 
-def _resource_by_uid(calendar: Any, uid: str) -> Any:
-    """Use a plain collection listing when Apple's UID REPORT returns 412."""
+def _resource_by_uid(
+    calendar: Any,
+    uid: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> Any:
+    """Resolve a UID directly, with a bounded time-window fallback when available."""
     try:
         return calendar.get_event_by_uid(uid)
     except caldav_error.NotFoundError:
         raise
     except Exception:
+        if start is None or end is None:
+            raise
         matches = []
-        for resource in calendar.events():
+        for resource in _calendar_resources_in_window(
+            calendar, start, end, expand=False
+        ):
             try:
                 component_uid = str(
                     resource.get_icalendar_component().get("uid", "")
@@ -436,17 +454,27 @@ def _resource_by_uid(calendar: Any, uid: str) -> Any:
         return matches[0]
 
 
-def _event_exists(calendar_name: str, uid: str) -> bool:
+def _event_exists(
+    calendar_name: str,
+    uid: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> bool:
     with _client() as client:
         calendar = _calendar(client, calendar_name)
         try:
-            _resource_by_uid(calendar, uid)
+            _resource_by_uid(calendar, uid, start, end)
         except caldav_error.NotFoundError:
             return False
         return True
 
 
-def _delete_icloud_event(calendar_name: str, uid: str) -> dict[str, Any]:
+def _delete_icloud_event(
+    calendar_name: str,
+    uid: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, Any]:
     """Refresh preconditions, retry 412 responses, and verify actual absence."""
     last_status: int | None = None
     for attempt in range(3):
@@ -455,7 +483,7 @@ def _delete_icloud_event(calendar_name: str, uid: str) -> dict[str, Any]:
         with _client() as client:
             calendar = _calendar(client, calendar_name)
             try:
-                resource = _resource_by_uid(calendar, uid)
+                resource = _resource_by_uid(calendar, uid, start, end)
             except caldav_error.NotFoundError:
                 return {
                     "uid": uid,
@@ -465,7 +493,7 @@ def _delete_icloud_event(calendar_name: str, uid: str) -> dict[str, Any]:
                     "verified": True,
                 }
             last_status = _resource_delete_status(resource)
-        if not _event_exists(calendar_name, uid):
+        if not _event_exists(calendar_name, uid, start, end):
             return {
                 "uid": uid,
                 "calendar": calendar_name,
@@ -821,7 +849,9 @@ def delete_zoom_event(
         )
 
     if matches:
-        calendar_result = _delete_icloud_event(calendar_name, calendar_uid)
+        calendar_result = _delete_icloud_event(
+            calendar_name, calendar_uid, start_dt, end_dt
+        )
     else:
         calendar_result = {
             "deleted": False,

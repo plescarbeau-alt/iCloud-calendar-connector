@@ -47,11 +47,17 @@ class DateTimeTests(unittest.TestCase):
 
 
 class DeleteTests(unittest.TestCase):
-    def test_uid_lookup_falls_back_after_report_error(self):
+    def test_uid_lookup_uses_bounded_search_after_report_error(self):
+        start = server._parse_datetime("2026-08-06T17:00:00-04:00")
+        end = server._parse_datetime("2026-08-06T17:15:00-04:00")
         wanted = Event()
         wanted.add("uid", "wanted")
+        wanted.add("dtstart", start)
+        wanted.add("dtend", end)
         other = Event()
         other.add("uid", "other")
+        other.add("dtstart", start)
+        other.add("dtend", end)
 
         class Resource:
             def __init__(self, component):
@@ -61,15 +67,49 @@ class DeleteTests(unittest.TestCase):
                 return self.component
 
         class Calendar:
+            search_calls = []
+
             def get_event_by_uid(self, _):
                 raise RuntimeError("412 Precondition Failed")
 
-            def events(self):
+            def search(self, **kwargs):
+                self.search_calls.append(kwargs)
                 return [Resource(other), Resource(wanted)]
 
-        found = server._resource_by_uid(Calendar(), "wanted")
+            def events(self):
+                raise AssertionError("the whole calendar must never be listed")
+
+        calendar = Calendar()
+        found = server._resource_by_uid(calendar, "wanted", start, end)
 
         self.assertEqual(str(found.get_icalendar_component()["uid"]), "wanted")
+        self.assertEqual(len(calendar.search_calls), 1)
+
+    def test_window_search_retries_with_bounded_padding(self):
+        class Calendar:
+            calls = []
+
+            def search(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) < 3:
+                    raise RuntimeError("412 Precondition Failed")
+                return []
+
+            def events(self):
+                raise AssertionError("the whole calendar must never be listed")
+
+        calendar = Calendar()
+        start = server._parse_datetime("2026-08-06T17:00:00-04:00")
+        end = server._parse_datetime("2026-08-06T17:15:00-04:00")
+
+        self.assertEqual(
+            server._calendar_resources_in_window(
+                calendar, start, end, expand=False
+            ),
+            [],
+        )
+        self.assertEqual(len(calendar.calls), 3)
+        self.assertEqual(calendar.calls[-1]["start"], start - server.timedelta(days=7))
 
     def test_delete_uses_current_etag_and_schedule_tag(self):
         calls = []
