@@ -580,9 +580,12 @@ async def terms(_: Request) -> HTMLResponse:
     )
 
 
+mcp_http_app = mcp.streamable_http_app()
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_: Starlette):
-    """Start the Streamable HTTP session manager for the mounted MCP app."""
+    """Start the session manager used by the mounted Streamable HTTP app."""
     async with mcp.session_manager.run():
         yield
 
@@ -600,7 +603,7 @@ app = Starlette(
         Route("/register", register, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
-        Mount("/", app=mcp.streamable_http_app()),
+        Mount("/", app=mcp_http_app),
     ],
     lifespan=lifespan,
 )
