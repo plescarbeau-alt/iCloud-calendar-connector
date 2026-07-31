@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import contextlib
 import hashlib
 import html
 import hmac
@@ -24,10 +23,8 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
-from starlette.routing import Mount, Route
 
 
 def _required(name: str) -> str:
@@ -580,33 +577,23 @@ async def terms(_: Request) -> HTMLResponse:
     )
 
 
-mcp_http_app = mcp.streamable_http_app()
-
-
-@contextlib.asynccontextmanager
-async def lifespan(_: Starlette):
-    """Start the session manager used by the mounted Streamable HTTP app."""
-    async with mcp.session_manager.run():
-        yield
-
-
-app = Starlette(
-    routes=[
-        Route("/", health),
-        Route("/docs", documentation),
-        Route("/privacy", privacy),
-        Route("/terms", terms),
-        Route("/.well-known/oauth-authorization-server", oauth_metadata),
-        Route("/.well-known/openid-configuration", oauth_metadata),
-        Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
-        Route("/.well-known/oauth-protected-resource/mcp", protected_resource_metadata),
-        Route("/register", register, methods=["POST"]),
-        Route("/authorize", authorize, methods=["GET", "POST"]),
-        Route("/token", token, methods=["POST"]),
-        Mount("/", app=mcp_http_app),
-    ],
-    lifespan=lifespan,
+mcp.custom_route("/", methods=["GET"])(health)
+mcp.custom_route("/docs", methods=["GET"])(documentation)
+mcp.custom_route("/privacy", methods=["GET"])(privacy)
+mcp.custom_route("/terms", methods=["GET"])(terms)
+mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])(oauth_metadata)
+mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])(oauth_metadata)
+mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])(
+    protected_resource_metadata
 )
+mcp.custom_route("/.well-known/oauth-protected-resource/mcp", methods=["GET"])(
+    protected_resource_metadata
+)
+mcp.custom_route("/register", methods=["POST"])(register)
+mcp.custom_route("/authorize", methods=["GET", "POST"])(authorize)
+mcp.custom_route("/token", methods=["POST"])(token)
+
+app = mcp.streamable_http_app()
 
 
 if __name__ == "__main__":
