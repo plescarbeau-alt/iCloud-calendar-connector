@@ -433,10 +433,13 @@ def create_event(
                 continue
         return None
 
+    write_completed = False
+    write_error: Exception | None = None
     try:
         with _client() as client:
             calendar = _calendar(client, calendar_name)
             calendar.add_event(payload.to_ical().decode("utf-8"))
+            write_completed = True
             try:
                 saved = calendar.get_event_by_uid(uid)
                 result = _event_result(saved, calendar_name)
@@ -445,12 +448,27 @@ def create_event(
                 return result
             except Exception:
                 pass
-    except Exception:
-        pass
+    except Exception as exc:
+        write_error = exc
 
     reconciled = reconcile()
     if reconciled is not None:
         return reconciled
+    if write_completed or (write_error is not None and "412" in str(write_error)):
+        return {
+            "uid": uid,
+            "calendar": calendar_name,
+            "title": title,
+            "start": start,
+            "end": end,
+            "verified": False,
+            "write_status": "accepted_but_icloud_verification_unavailable",
+            "do_not_retry": True,
+            "warning": (
+                "iCloud returned 412 during post-write verification. The event may already "
+                "be visible in the calendar; do not retry automatically."
+            ),
+        }
     raise RuntimeError(
         "iCloud did not confirm the event after the CalDAV write. "
         "The event may still exist; check the calendar before retrying."
@@ -527,6 +545,7 @@ def create_zoom_event(
             cleanup_error = f" Zoom cleanup also failed: {cleanup_exc}"
         raise RuntimeError(f"Calendar creation failed; the Zoom meeting was rolled back.{cleanup_error}") from exc
 
+    event_verified = bool(event.get("verified", False))
     return {
         "provider": provider,
         "calendar": calendar_name,
@@ -537,7 +556,11 @@ def create_zoom_event(
         "zoom_meeting_id": meeting_id,
         "zoom_join_url": join_url,
         "event": event,
-        "verified": True,
+        "verified": event_verified,
+        "calendar_write_status": (
+            "verified" if event_verified else "accepted_but_icloud_verification_unavailable"
+        ),
+        "do_not_retry": not event_verified,
     }
 
 
