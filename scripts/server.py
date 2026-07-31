@@ -21,6 +21,7 @@ from icalendar import Event
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -39,6 +40,8 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "https://codex-icloud-calendar.onrender.com
 MCP_RESOURCE = f"{PUBLIC_URL}/mcp"
 RESOURCE_ALIASES = {PUBLIC_URL, MCP_RESOURCE}
 OAUTH_SCOPE = "icloud-calendar"
+_used_authorization_codes: set[str] = set()
+_used_refresh_tokens: set[str] = set()
 
 
 def _b64encode(value: bytes) -> str:
@@ -183,18 +186,25 @@ mcp = FastMCP(
         issuer_url=AnyHttpUrl(PUBLIC_URL),
         resource_server_url=AnyHttpUrl(MCP_RESOURCE),
         required_scopes=[OAUTH_SCOPE],
+        service_documentation_url=AnyHttpUrl(f"{PUBLIC_URL}/docs"),
     ),
 )
 
 
-@mcp.tool()
+@mcp.tool(
+    title="List iCloud calendars",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+)
 def list_calendars() -> list[dict[str, str]]:
     """List only the iCloud calendars explicitly allowed for this connector."""
     with _client() as client:
         return [{"name": _calendar_name(calendar)} for calendar in _calendars(client)]
 
 
-@mcp.tool()
+@mcp.tool(
+    title="List iCloud calendar events",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+)
 def list_events(calendar_name: str, start: str, end: str) -> list[dict[str, Any]]:
     """List events overlapping a timezone-aware ISO 8601 interval."""
     start_dt = _parse_datetime(start)
@@ -207,7 +217,10 @@ def list_events(calendar_name: str, start: str, end: str) -> list[dict[str, Any]
         return [_event_result(resource, calendar_name) for resource in resources]
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Create an iCloud calendar event",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+)
 def create_event(
     calendar_name: str,
     title: str,
@@ -251,7 +264,10 @@ def create_event(
         return result
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Update an iCloud calendar event",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+)
 def update_event(
     calendar_name: str,
     uid: str,
@@ -288,7 +304,10 @@ def update_event(
         return result
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Delete an iCloud calendar event",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
+)
 def delete_event(calendar_name: str, uid: str) -> dict[str, Any]:
     """Delete an event by UID and verify that it is no longer retrievable."""
     with _client() as client:
@@ -325,6 +344,7 @@ async def protected_resource_metadata(_: Request) -> JSONResponse:
             "authorization_servers": [PUBLIC_URL],
             "scopes_supported": [OAUTH_SCOPE],
             "bearer_methods_supported": ["header"],
+            "resource_documentation": f"{PUBLIC_URL}/docs",
         }
     )
 
@@ -352,6 +372,9 @@ async def register(request: Request) -> JSONResponse:
             "client_id": client_id,
             "client_id_issued_at": now,
             "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": OAUTH_SCOPE,
         },
         status_code=201,
     )
@@ -442,9 +465,12 @@ async def token(request: Request) -> JSONResponse:
         return _oauth_error("invalid_client", "Unknown client.")
     now = int(time.time())
     if grant_type == "authorization_code":
-        code = _unsign(form.get("code", ""), "code")
+        raw_code = form.get("code", "")
+        code_hash = hashlib.sha256(raw_code.encode()).hexdigest()
+        code = _unsign(raw_code, "code")
         if (
             not code
+            or code_hash in _used_authorization_codes
             or code.get("client_id") != client_id
             or code.get("redirect_uri") != form.get("redirect_uri")
         ):
@@ -453,12 +479,20 @@ async def token(request: Request) -> JSONResponse:
         challenge = _b64encode(hashlib.sha256(verifier.encode()).digest())
         if not verifier or not hmac.compare_digest(challenge, str(code.get("code_challenge", ""))):
             return _oauth_error("invalid_grant", "PKCE verification failed.")
+        _used_authorization_codes.add(code_hash)
         resource = code["resource"]
         scopes = [OAUTH_SCOPE]
     elif grant_type == "refresh_token":
-        refresh = _unsign(form.get("refresh_token", ""), "refresh")
-        if not refresh or refresh.get("client_id") != client_id:
+        raw_refresh = form.get("refresh_token", "")
+        refresh_hash = hashlib.sha256(raw_refresh.encode()).hexdigest()
+        refresh = _unsign(raw_refresh, "refresh")
+        if (
+            not refresh
+            or refresh_hash in _used_refresh_tokens
+            or refresh.get("client_id") != client_id
+        ):
             return _oauth_error("invalid_grant", "Invalid refresh token.")
+        _used_refresh_tokens.add(refresh_hash)
         resource = refresh["resource"]
         scopes = list(refresh["scopes"])
     else:
@@ -490,6 +524,7 @@ async def token(request: Request) -> JSONResponse:
             "expires_in": 3600,
             "refresh_token": refresh_token,
             "scope": " ".join(scopes),
+            "resource": resource,
         },
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
@@ -499,9 +534,59 @@ async def health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "authentication": "oauth"})
 
 
+async def documentation(_: Request) -> HTMLResponse:
+    return HTMLResponse(
+        """<!doctype html><html lang="fr"><meta name="viewport" content="width=device-width">
+        <title>iCloud Calendar pour ChatGPT</title><style>
+        body{font:16px system-ui;line-height:1.55;max-width:720px;margin:48px auto;padding:0 20px}
+        h1,h2{line-height:1.2}</style><h1>iCloud Calendar pour ChatGPT</h1>
+        <p>Connecteur privé permettant à son propriétaire de consulter et gérer uniquement les
+        calendriers iCloud explicitement autorisés dans Render.</p>
+        <h2>Données traitées</h2><p>Noms de calendriers, événements, dates, lieux, descriptions et
+        liens nécessaires aux actions demandées. Les identifiants Apple et mots de passe
+        d’application restent des secrets Render et ne sont jamais envoyés à ChatGPT.</p>
+        <h2>Conservation</h2><p>Le connecteur ne crée pas de copie durable des calendriers.
+        Les données sont lues ou modifiées directement dans iCloud via CalDAV.</p>
+        <h2>Accès</h2><p>L’accès exige OAuth 2.1 avec PKCE et le mot de passe privé du connecteur.
+        Le propriétaire peut révoquer l’accès en renouvelant les secrets Render.</p>
+        <p><a href="/privacy">Politique de confidentialité</a> ·
+        <a href="/terms">Conditions d’utilisation</a></p></html>"""
+    )
+
+
+async def privacy(_: Request) -> HTMLResponse:
+    return HTMLResponse(
+        """<!doctype html><html lang="fr"><meta name="viewport" content="width=device-width">
+        <title>Confidentialité — iCloud Calendar</title><body style="font:16px system-ui;
+        line-height:1.55;max-width:720px;margin:48px auto;padding:0 20px">
+        <h1>Politique de confidentialité</h1><p>Cette app privée traite uniquement les données
+        nécessaires pour exécuter les demandes de son propriétaire dans les calendriers iCloud
+        autorisés. Elle ne vend, ne partage et ne conserve pas durablement ces données.</p>
+        <p>Les secrets Apple sont stockés dans Render et ne sont pas exposés aux clients MCP.</p>
+        </body></html>"""
+    )
+
+
+async def terms(_: Request) -> HTMLResponse:
+    return HTMLResponse(
+        """<!doctype html><html lang="fr"><meta name="viewport" content="width=device-width">
+        <title>Conditions — iCloud Calendar</title><body style="font:16px system-ui;
+        line-height:1.55;max-width:720px;margin:48px auto;padding:0 20px">
+        <h1>Conditions d’utilisation</h1><p>Cette app est destinée à l’usage privé de son
+        propriétaire. Toute création, modification ou suppression d’événement doit correspondre à
+        une demande explicite de l’utilisateur et peut être révoquée depuis Render ou Apple.</p>
+        </body></html>"""
+    )
+
+
+mcp_http_app = mcp.streamable_http_app()
+
 app = Starlette(
     routes=[
         Route("/", health),
+        Route("/docs", documentation),
+        Route("/privacy", privacy),
+        Route("/terms", terms),
         Route("/.well-known/oauth-authorization-server", oauth_metadata),
         Route("/.well-known/openid-configuration", oauth_metadata),
         Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
@@ -509,8 +594,9 @@ app = Starlette(
         Route("/register", register, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
-        Mount("/", app=mcp.streamable_http_app()),
-    ]
+        Mount("/", app=mcp_http_app),
+    ],
+    lifespan=mcp_http_app.lifespan,
 )
 
 
