@@ -11,14 +11,17 @@ import json
 import os
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request as URLRequest
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import caldav
+from caldav.elements import cdav, dav
+from caldav.lib import error as caldav_error
 from icalendar import Calendar as ICalendar
 from icalendar import Event
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -115,10 +118,21 @@ def _allowed_names() -> set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
 
 
-def _parse_datetime(value: str) -> datetime:
+def _parse_datetime(value: str, timezone_name: str | None = None) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("Date-times must include a timezone offset, for example -04:00.")
+    if timezone_name:
+        try:
+            timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown IANA timezone: {timezone_name}") from exc
+        localized = parsed.astimezone(timezone)
+        if localized.utcoffset() != parsed.utcoffset():
+            raise ValueError(
+                f"The offset in {value} does not match {timezone_name} at that date."
+            )
+        return localized
     return parsed
 
 
@@ -318,6 +332,158 @@ def _event_result(resource: Any, calendar_name: str) -> dict[str, Any]:
     }
 
 
+def _as_reference_datetime(value: Any, reference: datetime) -> datetime | None:
+    """Interpret floating iCloud values in the timezone supplied by the caller."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=reference.tzinfo) if value.tzinfo is None else value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime_time.min, tzinfo=reference.tzinfo)
+    return None
+
+
+def _component_overlaps(component: Any, start: datetime, end: datetime) -> bool:
+    candidate_start = _as_reference_datetime(component.get("dtstart").dt, start)
+    candidate_end_value = component.get("dtend")
+    candidate_end = (
+        _as_reference_datetime(candidate_end_value.dt, end)
+        if candidate_end_value is not None
+        else candidate_start
+    )
+    if candidate_start is None or candidate_end is None:
+        return False
+    return candidate_start < end and candidate_end > start
+
+
+def _component_matches_exactly(
+    component: Any, title: str, start: datetime, end: datetime
+) -> bool:
+    if str(component.get("summary", "")) != title:
+        return False
+    candidate_start = _as_reference_datetime(component.get("dtstart").dt, start)
+    candidate_end_value = component.get("dtend")
+    candidate_end = (
+        _as_reference_datetime(candidate_end_value.dt, end)
+        if candidate_end_value is not None
+        else None
+    )
+    return candidate_start == start and candidate_end == end
+
+
+def _calendar_resources_in_window(
+    calendar: Any, start: datetime, end: datetime, *, expand: bool
+) -> list[Any]:
+    """Fetch a padded window so legacy floating events are not lost by iCloud."""
+    try:
+        candidates = calendar.search(
+            event=True,
+            start=start - timedelta(days=1),
+            end=end + timedelta(days=1),
+            expand=expand,
+        )
+    except Exception:
+        candidates = calendar.events()
+    resources = []
+    for resource in candidates:
+        try:
+            if _component_overlaps(resource.get_icalendar_component(), start, end):
+                resources.append(resource)
+        except Exception:
+            continue
+    return resources
+
+
+def _resource_delete_status(resource: Any) -> int:
+    """Delete with the current iCloud precondition tags instead of a stale resource."""
+    try:
+        resource.get_properties([dav.GetEtag(), cdav.ScheduleTag()])
+    except Exception:
+        # A conditional wildcard still protects against deleting a missing resource.
+        pass
+    headers: dict[str, str] = {}
+    if resource.etag:
+        headers["if-match"] = str(resource.etag)
+    else:
+        headers["if-match"] = "*"
+    if resource.schedule_tag:
+        headers["if-schedule-tag-match"] = str(resource.schedule_tag)
+    response = resource.client.request(str(resource.url), "DELETE", "", headers)
+    if response.status not in (200, 204, 404, 412):
+        raise RuntimeError(f"iCloud DELETE returned HTTP {response.status}.")
+    return response.status
+
+
+def _resource_by_uid(calendar: Any, uid: str) -> Any:
+    """Use a plain collection listing when Apple's UID REPORT returns 412."""
+    try:
+        return calendar.get_event_by_uid(uid)
+    except caldav_error.NotFoundError:
+        raise
+    except Exception:
+        matches = []
+        for resource in calendar.events():
+            try:
+                component_uid = str(
+                    resource.get_icalendar_component().get("uid", "")
+                )
+                if component_uid == uid:
+                    matches.append(resource)
+            except Exception:
+                continue
+        if not matches:
+            raise caldav_error.NotFoundError(f"{uid} not found on server")
+        if len(matches) > 1:
+            raise RuntimeError(f"More than one iCloud event has UID {uid}.")
+        return matches[0]
+
+
+def _event_exists(calendar_name: str, uid: str) -> bool:
+    with _client() as client:
+        calendar = _calendar(client, calendar_name)
+        try:
+            _resource_by_uid(calendar, uid)
+        except caldav_error.NotFoundError:
+            return False
+        return True
+
+
+def _delete_icloud_event(calendar_name: str, uid: str) -> dict[str, Any]:
+    """Refresh preconditions, retry 412 responses, and verify actual absence."""
+    last_status: int | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1)
+        with _client() as client:
+            calendar = _calendar(client, calendar_name)
+            try:
+                resource = _resource_by_uid(calendar, uid)
+            except caldav_error.NotFoundError:
+                return {
+                    "uid": uid,
+                    "calendar": calendar_name,
+                    "deleted": attempt > 0,
+                    "already_absent": attempt == 0,
+                    "verified": True,
+                }
+            last_status = _resource_delete_status(resource)
+        if not _event_exists(calendar_name, uid):
+            return {
+                "uid": uid,
+                "calendar": calendar_name,
+                "deleted": True,
+                "already_absent": False,
+                "verified": True,
+            }
+    return {
+        "uid": uid,
+        "calendar": calendar_name,
+        "deleted": False,
+        "already_absent": False,
+        "verified": False,
+        "http_status": last_status,
+        "error": "iCloud still contains the event after three refreshed delete attempts.",
+    }
+
+
 mcp = FastMCP(
     "iCloud Calendar",
     host="0.0.0.0",
@@ -366,7 +532,9 @@ def list_events(calendar_name: str, start: str, end: str) -> list[dict[str, Any]
         raise ValueError("end must be later than start")
     with _client() as client:
         calendar = _calendar(client, calendar_name)
-        resources = calendar.search(event=True, start=start_dt, end=end_dt, expand=True)
+        resources = _calendar_resources_in_window(
+            calendar, start_dt, end_dt, expand=True
+        )
         return [_event_result(resource, calendar_name) for resource in resources]
 
 
@@ -382,10 +550,11 @@ def create_event(
     description: str = "",
     location: str = "",
     url: str = "",
+    timezone: str = "America/Toronto",
 ) -> dict[str, Any]:
     """Create an event, then read it back from iCloud to verify persistence."""
-    start_dt = _parse_datetime(start)
-    end_dt = _parse_datetime(end)
+    start_dt = _parse_datetime(start, timezone)
+    end_dt = _parse_datetime(end, timezone)
     if end_dt <= start_dt:
         raise ValueError("end must be later than start")
 
@@ -491,8 +660,8 @@ def create_zoom_event(
     attendees: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a real Zoom meeting, save it in an allowed iCloud or Google calendar, and verify it."""
-    start_dt = _parse_datetime(start)
-    end_dt = _parse_datetime(end)
+    start_dt = _parse_datetime(start, timezone)
+    end_dt = _parse_datetime(end, timezone)
     if end_dt <= start_dt:
         raise ValueError("end must be later than start")
 
@@ -525,6 +694,7 @@ def create_zoom_event(
                 description=event_description,
                 location=event_location,
                 url=join_url,
+                timezone=timezone,
             )
         else:
             event = _create_google_event(
@@ -577,6 +747,7 @@ def update_event(
     description: str | None = None,
     location: str | None = None,
     url: str | None = None,
+    timezone: str = "America/Toronto",
 ) -> dict[str, Any]:
     """Update an event by UID, then read it back to verify persistence."""
     with _client() as client:
@@ -587,10 +758,10 @@ def update_event(
                 component["summary"] = title
             if start is not None:
                 component.pop("dtstart", None)
-                component.add("dtstart", _parse_datetime(start))
+                component.add("dtstart", _parse_datetime(start, timezone))
             if end is not None:
                 component.pop("dtend", None)
-                component.add("dtend", _parse_datetime(end))
+                component.add("dtend", _parse_datetime(end, timezone))
             if description is not None:
                 component["description"] = description
             if location is not None:
@@ -610,15 +781,79 @@ def update_event(
 )
 def delete_event(calendar_name: str, uid: str) -> dict[str, Any]:
     """Delete an event by UID and verify that it is no longer retrievable."""
+    return _delete_icloud_event(calendar_name, uid)
+
+
+@mcp.tool(
+    title="Delete a Zoom calendar event by title and time",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+)
+def delete_zoom_event(
+    calendar_name: str,
+    title: str,
+    start: str,
+    end: str,
+    zoom_meeting_id: str = "",
+) -> dict[str, Any]:
+    """Delete one matching iCloud event and, when supplied, its Zoom meeting."""
+    start_dt = _parse_datetime(start)
+    end_dt = _parse_datetime(end)
+    if end_dt <= start_dt:
+        raise ValueError("end must be later than start")
+
+    matches: list[Any] = []
     with _client() as client:
         calendar = _calendar(client, calendar_name)
-        resource = calendar.get_event_by_uid(uid)
-        resource.delete()
+        candidates = _calendar_resources_in_window(
+            calendar, start_dt, end_dt, expand=False
+        )
+        for resource in candidates:
+            try:
+                component = resource.get_icalendar_component()
+                if _component_matches_exactly(component, title, start_dt, end_dt):
+                    matches.append(resource)
+            except Exception:
+                continue
+        if len(matches) > 1:
+            raise RuntimeError("More than one matching iCloud event was found; nothing was deleted.")
+        calendar_uid = (
+            str(matches[0].get_icalendar_component().get("uid", "")) if matches else ""
+        )
+
+    if matches:
+        calendar_result = _delete_icloud_event(calendar_name, calendar_uid)
+    else:
+        calendar_result = {
+            "deleted": False,
+            "already_absent": True,
+            "verified": True,
+        }
+
+    zoom_deleted = False
+    zoom_already_absent = False
+    if zoom_meeting_id.strip():
         try:
-            calendar.get_event_by_uid(uid)
-        except Exception:
-            return {"uid": uid, "calendar": calendar_name, "deleted": True, "verified": True}
-        return {"uid": uid, "calendar": calendar_name, "deleted": True, "verified": False}
+            _delete_zoom_meeting(zoom_meeting_id.strip())
+            zoom_deleted = True
+        except Exception as exc:
+            if "HTTP 404" in str(exc):
+                zoom_already_absent = True
+            else:
+                raise
+
+    return {
+        "calendar": calendar_name,
+        "title": title,
+        "calendar_event_found": bool(matches),
+        "calendar_event_uid": calendar_uid,
+        "calendar_deleted": bool(calendar_result["deleted"]),
+        "calendar_already_absent": bool(calendar_result["already_absent"]),
+        "calendar_deletion_verified": bool(calendar_result["verified"]),
+        "zoom_deleted": zoom_deleted,
+        "zoom_already_absent": zoom_already_absent,
+        "do_not_retry": bool(matches) and not bool(calendar_result["verified"]),
+        **({"calendar_error": calendar_result["error"]} if "error" in calendar_result else {}),
+    }
 
 
 async def oauth_metadata(_: Request) -> JSONResponse:
