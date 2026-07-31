@@ -1,7 +1,7 @@
-# iCloud Calendar pour Codex
+# Zoom Calendar Everywhere pour ChatGPT
 
-Connecteur MCP privé pour accéder à un ensemble explicitement autorisé de
-calendriers iCloud via CalDAV.
+Connecteur MCP privé pour créer de véritables réunions Zoom et les enregistrer
+dans des calendriers iCloud ou Google explicitement autorisés.
 
 ## Sécurité
 
@@ -13,6 +13,7 @@ calendriers iCloud via CalDAV.
   demande la valeur `ICLOUD_MCP_BEARER_TOKEN`, sans jamais la transmettre au
   client MCP.
 - Révoquer immédiatement le mot de passe d’application Apple en cas de doute.
+- Conserver les identifiants Zoom et Google uniquement dans les secrets Render.
 
 ## Variables
 
@@ -52,13 +53,26 @@ Render :
 - `ICLOUD_USERNAME`
 - `ICLOUD_APP_PASSWORD`
 - `ICLOUD_ALLOWED_CALENDARS`
+- `ZOOM_ACCOUNT_ID`
+- `ZOOM_CLIENT_ID`
+- `ZOOM_CLIENT_SECRET`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN`
+
+`GOOGLE_ALLOWED_CALENDARS` est un objet JSON qui associe le nom demandé à
+l’identifiant Google Calendar, par exemple
+`{"info@pierrelescarbeau.com":"primary"}`.
 
 ## Outils MCP
 
 - `list_calendars`
 - `list_events`
 - `create_event`
+- `create_zoom_event`
 - `update_event`
 - `delete_event`
 
-Chaque écriture est relue depuis iCloud avant d’être annoncée comme vérifiée.
+Chaque écriture est relue depuis le calendrier cible avant d’être annoncée comme vérifiée.
+`create_zoom_event` crée d’abord la réunion Zoom, écrit ensuite l’événement dans
+iCloud ou Google, puis supprime la réunion Zoom si l’écriture du calendrier échoue.

@@ -11,9 +11,12 @@ import json
 import os
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.request import Request as URLRequest
+from urllib.request import urlopen
 
 import caldav
 from icalendar import Calendar as ICalendar
@@ -119,6 +122,150 @@ def _parse_datetime(value: str) -> datetime:
     return parsed
 
 
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+    form: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request_headers = {"Accept": "application/json", **(headers or {})}
+    body: bytes | None = None
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        request_headers["Content-Type"] = "application/json"
+    elif form is not None:
+        body = urlencode(form).encode()
+        request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+    request = URLRequest(url, data=body, headers=request_headers, method=method)
+    try:
+        with urlopen(request, timeout=30) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else {}
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")[:1000]
+        raise RuntimeError(f"Remote API returned HTTP {exc.code}: {raw}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Remote API is unavailable: {exc.reason}") from exc
+
+
+def _zoom_access_token() -> str:
+    client_id = _required("ZOOM_CLIENT_ID")
+    client_secret = _required("ZOOM_CLIENT_SECRET")
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    query = urlencode(
+        {
+            "grant_type": "account_credentials",
+            "account_id": _required("ZOOM_ACCOUNT_ID"),
+        }
+    )
+    result = _http_json(
+        "POST",
+        f"https://zoom.us/oauth/token?{query}",
+        headers={"Authorization": f"Basic {credentials}"},
+    )
+    token = str(result.get("access_token", ""))
+    if not token:
+        raise RuntimeError("Zoom did not return an access token.")
+    return token
+
+
+def _create_zoom_meeting(title: str, start: datetime, end: datetime, timezone: str) -> dict[str, Any]:
+    duration = int((end - start).total_seconds() // 60)
+    if duration <= 0:
+        raise ValueError("end must be later than start")
+    return _http_json(
+        "POST",
+        "https://api.zoom.us/v2/users/me/meetings",
+        headers={"Authorization": f"Bearer {_zoom_access_token()}"},
+        payload={
+            "topic": title,
+            "type": 2,
+            "start_time": start.isoformat(),
+            "duration": duration,
+            "timezone": timezone,
+            "settings": {"waiting_room": True, "join_before_host": False},
+        },
+    )
+
+
+def _delete_zoom_meeting(meeting_id: str) -> None:
+    _http_json(
+        "DELETE",
+        f"https://api.zoom.us/v2/meetings/{quote(meeting_id, safe='')}",
+        headers={"Authorization": f"Bearer {_zoom_access_token()}"},
+    )
+
+
+def _google_access_token() -> str:
+    result = _http_json(
+        "POST",
+        "https://oauth2.googleapis.com/token",
+        form={
+            "client_id": _required("GOOGLE_CLIENT_ID"),
+            "client_secret": _required("GOOGLE_CLIENT_SECRET"),
+            "refresh_token": _required("GOOGLE_REFRESH_TOKEN"),
+            "grant_type": "refresh_token",
+        },
+    )
+    token = str(result.get("access_token", ""))
+    if not token:
+        raise RuntimeError("Google did not return an access token.")
+    return token
+
+
+def _google_calendar_map() -> dict[str, str]:
+    raw = os.getenv("GOOGLE_ALLOWED_CALENDARS", "").strip()
+    if not raw:
+        return {"info@pierrelescarbeau.com": "primary"}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GOOGLE_ALLOWED_CALENDARS must be a JSON object.") from exc
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        raise RuntimeError("GOOGLE_ALLOWED_CALENDARS must map calendar names to IDs.")
+    return value
+
+
+def _create_google_event(
+    calendar_name: str,
+    title: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    description: str,
+    location: str,
+    attendees: list[str],
+) -> dict[str, Any]:
+    calendars = _google_calendar_map()
+    if calendar_name not in calendars:
+        raise PermissionError(f"Google calendar '{calendar_name}' is not allowed.")
+    calendar_id = calendars[calendar_name]
+    token = _google_access_token()
+    event = _http_json(
+        "POST",
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}/events?sendUpdates=all",
+        headers={"Authorization": f"Bearer {token}"},
+        payload={
+            "summary": title,
+            "description": description,
+            "location": location,
+            "start": {"dateTime": start.isoformat(), "timeZone": timezone},
+            "end": {"dateTime": end.isoformat(), "timeZone": timezone},
+            "attendees": [{"email": email} for email in attendees],
+        },
+    )
+    event_id = str(event.get("id", ""))
+    if not event_id:
+        raise RuntimeError("Google did not return an event ID.")
+    return _http_json(
+        "GET",
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='')}/events/{quote(event_id, safe='')}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
 def _calendar_name(calendar: Any) -> str:
     try:
         return str(calendar.get_display_name())
@@ -191,13 +338,20 @@ mcp = FastMCP(
 
 
 @mcp.tool(
-    title="List iCloud calendars",
+    title="List calendars available for Zoom events",
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
 )
 def list_calendars() -> list[dict[str, str]]:
-    """List only the iCloud calendars explicitly allowed for this connector."""
+    """List writable iCloud and Google calendars explicitly allowed for this connector."""
     with _client() as client:
-        return [{"name": _calendar_name(calendar)} for calendar in _calendars(client)]
+        calendars = [
+            {"name": _calendar_name(calendar), "provider": "icloud"}
+            for calendar in _calendars(client)
+        ]
+    calendars.extend(
+        {"name": name, "provider": "google"} for name in _google_calendar_map()
+    )
+    return calendars
 
 
 @mcp.tool(
@@ -254,13 +408,160 @@ def create_event(
     payload.add("version", "2.0")
     payload.add_component(event)
 
-    with _client() as client:
-        calendar = _calendar(client, calendar_name)
-        calendar.add_event(payload.to_ical().decode("utf-8"))
-        saved = calendar.get_event_by_uid(uid)
-        result = _event_result(saved, calendar_name)
-        result["verified"] = result["uid"] == uid
-        return result
+    def reconcile() -> dict[str, Any] | None:
+        # iCloud can return HTTP 412 after accepting a CalDAV write. Re-open the
+        # collection and search by our unique UID before treating it as failed.
+        for attempt in range(3):
+            if attempt:
+                time.sleep(1)
+            try:
+                with _client() as verify_client:
+                    verify_calendar = _calendar(verify_client, calendar_name)
+                    resources = verify_calendar.search(
+                        event=True,
+                        start=start_dt - timedelta(minutes=1),
+                        end=end_dt + timedelta(minutes=1),
+                        expand=False,
+                    )
+                    for resource in resources:
+                        candidate = _event_result(resource, calendar_name)
+                        if candidate.get("uid") == uid:
+                            candidate["verified"] = True
+                            candidate["verification_method"] = "fresh_calendar_search"
+                            return candidate
+            except Exception:
+                continue
+        return None
+
+    write_completed = False
+    write_error: Exception | None = None
+    try:
+        with _client() as client:
+            calendar = _calendar(client, calendar_name)
+            calendar.add_event(payload.to_ical().decode("utf-8"))
+            write_completed = True
+            try:
+                saved = calendar.get_event_by_uid(uid)
+                result = _event_result(saved, calendar_name)
+                result["verified"] = result["uid"] == uid
+                result["verification_method"] = "direct_uid_lookup"
+                return result
+            except Exception:
+                pass
+    except Exception as exc:
+        write_error = exc
+
+    reconciled = reconcile()
+    if reconciled is not None:
+        return reconciled
+    if write_completed or (write_error is not None and "412" in str(write_error)):
+        return {
+            "uid": uid,
+            "calendar": calendar_name,
+            "title": title,
+            "start": start,
+            "end": end,
+            "verified": False,
+            "write_status": "accepted_but_icloud_verification_unavailable",
+            "do_not_retry": True,
+            "warning": (
+                "iCloud returned 412 during post-write verification. The event may already "
+                "be visible in the calendar; do not retry automatically."
+            ),
+        }
+    raise RuntimeError(
+        "iCloud did not confirm the event after the CalDAV write. "
+        "The event may still exist; check the calendar before retrying."
+    )
+
+
+@mcp.tool(
+    title="Create a verified Zoom event in iCloud or Google Calendar",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+)
+def create_zoom_event(
+    calendar_name: str,
+    title: str,
+    start: str,
+    end: str,
+    timezone: str = "America/Toronto",
+    provider: str | None = None,
+    description: str = "",
+    location: str = "",
+    attendees: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create a real Zoom meeting, save it in an allowed iCloud or Google calendar, and verify it."""
+    start_dt = _parse_datetime(start)
+    end_dt = _parse_datetime(end)
+    if end_dt <= start_dt:
+        raise ValueError("end must be later than start")
+
+    if provider is None:
+        if calendar_name in _allowed_names():
+            provider = "icloud"
+        elif calendar_name in _google_calendar_map():
+            provider = "google"
+        else:
+            raise LookupError(f"Calendar '{calendar_name}' is not configured.")
+    provider = provider.lower()
+    if provider not in {"icloud", "google"}:
+        raise ValueError("provider must be 'icloud' or 'google'.")
+
+    meeting = _create_zoom_meeting(title, start_dt, end_dt, timezone)
+    meeting_id = str(meeting.get("id", ""))
+    join_url = str(meeting.get("join_url", ""))
+    if not meeting_id or not join_url.startswith("https://") or "zoom.us/" not in join_url:
+        raise RuntimeError("Zoom did not return a valid meeting ID and join URL.")
+
+    event_description = f"{description.strip()}\n\nZoom: {join_url}".strip()
+    event_location = location or "Zoom"
+    try:
+        if provider == "icloud":
+            event = create_event(
+                calendar_name=calendar_name,
+                title=title,
+                start=start,
+                end=end,
+                description=event_description,
+                location=event_location,
+                url=join_url,
+            )
+        else:
+            event = _create_google_event(
+                calendar_name=calendar_name,
+                title=title,
+                start=start_dt,
+                end=end_dt,
+                timezone=timezone,
+                description=event_description,
+                location=event_location,
+                attendees=attendees or [],
+            )
+    except Exception as exc:
+        cleanup_error = ""
+        try:
+            _delete_zoom_meeting(meeting_id)
+        except Exception as cleanup_exc:
+            cleanup_error = f" Zoom cleanup also failed: {cleanup_exc}"
+        raise RuntimeError(f"Calendar creation failed; the Zoom meeting was rolled back.{cleanup_error}") from exc
+
+    event_verified = bool(event.get("verified", False))
+    return {
+        "provider": provider,
+        "calendar": calendar_name,
+        "title": title,
+        "start": start,
+        "end": end,
+        "timezone": timezone,
+        "zoom_meeting_id": meeting_id,
+        "zoom_join_url": join_url,
+        "event": event,
+        "verified": event_verified,
+        "calendar_write_status": (
+            "verified" if event_verified else "accepted_but_icloud_verification_unavailable"
+        ),
+        "do_not_retry": not event_verified,
+    }
 
 
 @mcp.tool(
@@ -318,6 +619,98 @@ def delete_event(calendar_name: str, uid: str) -> dict[str, Any]:
         except Exception:
             return {"uid": uid, "calendar": calendar_name, "deleted": True, "verified": True}
         return {"uid": uid, "calendar": calendar_name, "deleted": True, "verified": False}
+
+
+@mcp.tool(
+    title="Delete a Zoom calendar event by title and time",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+)
+def delete_zoom_event(
+    calendar_name: str,
+    title: str,
+    start: str,
+    end: str,
+    zoom_meeting_id: str = "",
+) -> dict[str, Any]:
+    """Delete one matching iCloud event and, when supplied, its Zoom meeting."""
+    start_dt = _parse_datetime(start)
+    end_dt = _parse_datetime(end)
+    if end_dt <= start_dt:
+        raise ValueError("end must be later than start")
+
+    matches: list[Any] = []
+    with _client() as client:
+        calendar = _calendar(client, calendar_name)
+        try:
+            candidates = calendar.search(
+                event=True,
+                start=start_dt - timedelta(minutes=1),
+                end=end_dt + timedelta(minutes=1),
+                expand=False,
+            )
+        except Exception:
+            # Apple can reject a time-range REPORT with 412 while a plain
+            # calendar collection listing still succeeds.
+            candidates = calendar.events()
+        for resource in candidates:
+            try:
+                component = resource.get_icalendar_component()
+                candidate_title = str(component.get("summary", ""))
+                candidate_start = component.get("dtstart").dt
+                if isinstance(candidate_start, datetime):
+                    if candidate_start.tzinfo is None:
+                        candidate_start = candidate_start.astimezone()
+                    in_window = start_dt <= candidate_start < end_dt
+                else:
+                    in_window = candidate_start.isoformat() == start_dt.date().isoformat()
+                if candidate_title == title and in_window:
+                    matches.append(resource)
+            except Exception:
+                continue
+        if len(matches) > 1:
+            raise RuntimeError("More than one matching iCloud event was found; nothing was deleted.")
+        calendar_deleted = False
+        calendar_verified = False
+        calendar_uid = ""
+        if matches:
+            calendar_uid = str(matches[0].get_icalendar_component().get("uid", ""))
+            try:
+                matches[0].delete()
+                calendar_deleted = True
+            except Exception as exc:
+                if "412" in str(exc):
+                    calendar_deleted = True
+                else:
+                    raise
+            try:
+                with _client() as verify_client:
+                    _calendar(verify_client, calendar_name).get_event_by_uid(calendar_uid)
+            except Exception:
+                calendar_verified = True
+
+    zoom_deleted = False
+    zoom_already_absent = False
+    if zoom_meeting_id.strip():
+        try:
+            _delete_zoom_meeting(zoom_meeting_id.strip())
+            zoom_deleted = True
+        except Exception as exc:
+            if "HTTP 404" in str(exc):
+                zoom_already_absent = True
+            else:
+                raise
+
+    return {
+        "calendar": calendar_name,
+        "title": title,
+        "calendar_event_found": bool(matches),
+        "calendar_event_uid": calendar_uid,
+        "calendar_deleted": calendar_deleted,
+        "calendar_deletion_verified": calendar_verified,
+        "zoom_deleted": zoom_deleted,
+        "zoom_already_absent": zoom_already_absent,
+        "do_not_retry": calendar_deleted and not calendar_verified,
+    }
 
 
 async def oauth_metadata(_: Request) -> JSONResponse:

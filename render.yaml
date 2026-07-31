@@ -12,6 +12,20 @@ services:
         sync: false
       - key: ICLOUD_ALLOWED_CALENDARS
         sync: false
+      - key: ZOOM_ACCOUNT_ID
+        sync: false
+      - key: ZOOM_CLIENT_ID
+        sync: false
+      - key: ZOOM_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: GOOGLE_ALLOWED_CALENDARS
+        value: '{"info@pierrelescarbeau.com":"primary"}'
       - key: ICLOUD_MCP_BEARER_TOKEN
         generateValue: true
       - key: ICLOUD_OAUTH_SIGNING_KEY
